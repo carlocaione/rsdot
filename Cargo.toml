@@ -1,0 +1,12 @@
+[package]
+name = "rsdot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.98"
+clap = { version = "4.5.38", features = ["derive"] }
+git2 = "0.20.2"
+inquire = "0.7.5"
+owo-colors = "4.2.1"
+walkdir = "2.5.0"
