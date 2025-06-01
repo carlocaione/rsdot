@@ -60,195 +60,193 @@ fn validate_file(file: &str) -> Result<PathBuf, String> {
 
 struct FileStatus(PathBuf, Option<Status>);
 
-impl Commands {
-    fn do_status(&self, vault: &Path, repo: Option<&Repository>) -> Result<()> {
-        println!();
+fn do_status(vault: &Path, repo: Option<&Repository>) -> Result<()> {
+    println!();
+    println!(
+        "  {} Vault location: {}",
+        "→".blue(),
+        vault.display().cyan()
+    );
+
+    if let Some(repo) = repo {
         println!(
-            "  {} Vault location: {}",
+            "  {} GIT repo location: {}",
             "→".blue(),
-            vault.display().to_string().cyan()
+            repo.path().display().cyan()
         );
 
-        if let Some(repo) = repo {
-            println!(
-                "  {} GIT repo location: {}",
-                "→".blue(),
-                repo.path().display().cyan()
-            );
-
-            if let Ok(head) = repo.head() {
-                if let Some(branch_name) = head.shorthand() {
-                    println!("  {} Current branch: {}", "→".blue(), branch_name.cyan());
-                }
+        if let Ok(head) = repo.head() {
+            if let Some(branch_name) = head.shorthand() {
+                println!("  {} Current branch: {}", "→".blue(), branch_name.cyan());
             }
         }
-        println!();
+    }
+    println!();
 
-        let mut confs = fs::read_dir(vault)
-            .context("Failed to read vault directory")?
+    let mut confs = fs::read_dir(vault)
+        .context("Failed to read vault directory")?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let file_name = path.file_name()?.to_str()?;
+
+            if path.is_dir() && !file_name.starts_with('.') {
+                Some((file_name.to_string(), path))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<(String, PathBuf)>>();
+
+    if confs.is_empty() {
+        println!("  {} No configurations found", "ℹ".blue());
+        return Ok(());
+    }
+
+    confs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (conf_name, conf_path) in confs {
+        println!("  {} {}", "→".blue(), conf_name.red().bold());
+
+        let files: Vec<FileStatus> = WalkDir::new(&conf_path)
+            .into_iter()
             .filter_map(|entry| entry.ok())
             .filter_map(|entry| {
                 let path = entry.path();
-                let file_name = path.file_name()?.to_str()?;
+                let rel_path = path.strip_prefix(vault).ok()?;
 
-                if path.is_dir() && !file_name.starts_with('.') {
-                    Some((file_name.to_string(), path))
-                } else {
-                    None
-                }
+                let status = match repo {
+                    None => None,
+                    Some(repo) => repo.status_file(rel_path).ok(),
+                };
+
+                Some(FileStatus(path.to_path_buf(), status))
             })
-            .collect::<Vec<(String, PathBuf)>>();
+            .skip(1)
+            .collect();
 
-        if confs.is_empty() {
-            println!("  {} No configurations found", "ℹ".blue());
-            return Ok(());
-        }
-
-        confs.sort_by(|a, b| a.0.cmp(&b.0));
-
-        for (conf_name, conf_path) in confs {
-            println!("  {} {}", "→".blue(), conf_name.red().bold());
-
-            let files: Vec<FileStatus> = WalkDir::new(&conf_path)
-                .into_iter()
-                .filter_map(|entry| entry.ok())
-                .filter_map(|entry| {
-                    let path = entry.path();
-                    let rel_path = path.strip_prefix(vault).ok()?;
-
-                    let status = match repo {
-                        None => None,
-                        Some(repo) => repo.status_file(rel_path).ok(),
-                    };
-
-                    Some(FileStatus(path.to_path_buf(), status))
-                })
-                .skip(1)
-                .collect();
-
-            if files.is_empty() {
-                println!("      {} (empty)", "·".dimmed());
-            } else {
-                for file_status in files {
-                    print_status(file_status, &conf_path).context("Failed to print file status")?;
-                }
+        if files.is_empty() {
+            println!("      {} (empty)", "·".dimmed());
+        } else {
+            for file_status in files {
+                print_status(file_status, &conf_path).context("Failed to print file status")?;
             }
-
-            println!();
         }
 
-        Ok(())
+        println!();
     }
 
-    fn do_add(&self, vault: &Path, conf_name: &str, files: &Option<Vec<PathBuf>>) -> Result<()> {
-        let conf_path = vault.join(conf_name);
+    Ok(())
+}
 
-        if !conf_path.exists() {
-            let should_create = Confirm::new(&format!(
-                "'{}' configuration does not exist. Do you want to create it?",
-                conf_name
-            ))
-            .with_default(false)
-            .prompt()
-            .context("Failed to get user confirmation")?;
+fn do_add(vault: &Path, conf_name: &str, files: &Option<Vec<PathBuf>>) -> Result<()> {
+    let conf_path = vault.join(conf_name);
 
-            if !should_create {
-                return Ok(());
-            }
+    if !conf_path.exists() {
+        let should_create = Confirm::new(&format!(
+            "'{}' configuration does not exist. Do you want to create it?",
+            conf_name
+        ))
+        .with_default(false)
+        .prompt()
+        .context("Failed to get user confirmation")?;
 
-            fs::create_dir_all(&conf_path).context("Cannot create the configuration directory")?;
-
-            println!(
-                "  {} Created configuration: {}",
-                "✓".green(),
-                conf_name.cyan()
-            );
-        }
-
-        let Some(files) = files else {
-            println!("  {} No files specified", "ℹ".blue());
-            return Ok(());
-        };
-
-        move_and_symlink(files, &conf_path).context("Failed to move and symlink files")?;
-
-        Ok(())
-    }
-
-    fn do_sync(&self, repo: Option<&Repository>, push: bool) -> Result<()> {
-        let Some(repo) = repo else {
-            bail!("GIT repo not found");
-        };
-
-        let mut index = repo.index().context("cannot get the index file")?;
-        let statuses = repo
-            .statuses(None)
-            .context("Failed to get repository status")?;
-
-        if statuses.is_empty() {
-            println!("  {} No changes to sync", "ℹ".blue());
+        if !should_create {
             return Ok(());
         }
 
-        println!("  {} Adding changes to git...", "→".blue());
-        index
-            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-            .context("Failed to add files to git index")?;
-        index.write().context("Failed to write git index")?;
-
-        let tree_id = index.write_tree().context("Failed to write git tree")?;
-        let tree = repo.find_tree(tree_id).context("Failed to find git tree")?;
-
-        let signature = repo.signature().context("Failed to get git signature")?;
-        let head = repo
-            .head()
-            .context("Failed to get HEAD reference")?
-            .target()
-            .context("No HEAD commit found")?;
-        let parent_commit = repo
-            .find_commit(head)
-            .context("Failed to find parent commit")?;
-
-        let commit_id = repo
-            .commit(
-                Some("HEAD"),
-                &signature,
-                &signature,
-                "Sync dotfiles",
-                &tree,
-                &[&parent_commit],
-            )
-            .context("Failed to create commit")?;
+        fs::create_dir_all(&conf_path).context("Cannot create the configuration directory")?;
 
         println!(
-            "  {} Committed changes: {}",
+            "  {} Created configuration: {}",
             "✓".green(),
-            commit_id.to_string()[..7].to_string().yellow()
+            conf_name.cyan()
         );
-
-        if push {
-            println!("  {} Pushing to remote...", "→".blue());
-
-            let mut remote = repo
-                .find_remote("origin")
-                .context("Remote 'origin' not found")?;
-
-            let head = repo
-                .head()
-                .context("Failed to get HEAD reference for push")?;
-            let branch_name = head
-                .shorthand()
-                .ok_or_else(|| anyhow!("Cannot determine current branch"))?;
-
-            remote
-                .push(&[&format!("refs/heads/{}", branch_name)], None)
-                .context("Failed to push to remote")?;
-
-            println!("  {} Pushed to remote", "✓".green());
-        }
-
-        Ok(())
     }
+
+    let Some(files) = files else {
+        println!("  {} No files specified", "ℹ".blue());
+        return Ok(());
+    };
+
+    move_and_symlink(files, &conf_path).context("Failed to move and symlink files")?;
+
+    Ok(())
+}
+
+fn do_sync(repo: Option<&Repository>, push: bool) -> Result<()> {
+    let Some(repo) = repo else {
+        bail!("GIT repo not found");
+    };
+
+    let mut index = repo.index().context("cannot get the index file")?;
+    let statuses = repo
+        .statuses(None)
+        .context("Failed to get repository status")?;
+
+    if statuses.is_empty() {
+        println!("  {} No changes to sync", "ℹ".blue());
+        return Ok(());
+    }
+
+    println!("  {} Adding changes to git...", "→".blue());
+    index
+        .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+        .context("Failed to add files to git index")?;
+    index.write().context("Failed to write git index")?;
+
+    let tree_id = index.write_tree().context("Failed to write git tree")?;
+    let tree = repo.find_tree(tree_id).context("Failed to find git tree")?;
+
+    let signature = repo.signature().context("Failed to get git signature")?;
+    let head = repo
+        .head()
+        .context("Failed to get HEAD reference")?
+        .target()
+        .context("No HEAD commit found")?;
+    let parent_commit = repo
+        .find_commit(head)
+        .context("Failed to find parent commit")?;
+
+    let commit_id = repo
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "Sync dotfiles",
+            &tree,
+            &[&parent_commit],
+        )
+        .context("Failed to create commit")?;
+
+    println!(
+        "  {} Committed changes: {}",
+        "✓".green(),
+        commit_id.to_string()[..7].to_string().yellow()
+    );
+
+    if push {
+        println!("  {} Pushing to remote...", "→".blue());
+
+        let mut remote = repo
+            .find_remote("origin")
+            .context("Remote 'origin' not found")?;
+
+        let head = repo
+            .head()
+            .context("Failed to get HEAD reference for push")?;
+        let branch_name = head
+            .shorthand()
+            .ok_or_else(|| anyhow!("Cannot determine current branch"))?;
+
+        remote
+            .push(&[&format!("refs/heads/{}", branch_name)], None)
+            .context("Failed to push to remote")?;
+
+        println!("  {} Pushed to remote", "✓".green());
+    }
+
+    Ok(())
 }
 
 fn print_status(file_status: FileStatus, conf_path: &Path) -> Result<()> {
@@ -258,7 +256,6 @@ fn print_status(file_status: FileStatus, conf_path: &Path) -> Result<()> {
         .strip_prefix(conf_path)
         .context("Failed to strip path prefix")?
         .to_str()
-        .map(String::from)
         .context("Failed to convert path to string")?;
 
     match status {
@@ -345,7 +342,7 @@ fn move_and_symlink(files: &[PathBuf], to: &Path) -> Result<()> {
     for f in files {
         let dest = to.join(f);
         if dest.exists() {
-            println!("{} already existing. Skipping", dest.display());
+            println!("  {} {} already existing. Skipping", "⚠".yellow(), dest.display().cyan());
             continue;
         }
 
@@ -390,9 +387,9 @@ fn main() -> Result<()> {
     let repo = Repository::open(&vault).ok();
 
     match &args.cmd {
-        Commands::Status => args.cmd.do_status(&vault, repo.as_ref())?,
-        Commands::Add { conf_name, files } => args.cmd.do_add(&vault, conf_name, files)?,
-        Commands::Sync { push } => args.cmd.do_sync(repo.as_ref(), *push)?,
+        Commands::Status => do_status(&vault, repo.as_ref())?,
+        Commands::Add { conf_name, files } => do_add(&vault, conf_name, files)?,
+        Commands::Sync { push } => do_sync(repo.as_ref(), *push)?,
     }
 
     Ok(())
